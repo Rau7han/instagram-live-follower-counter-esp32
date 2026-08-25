@@ -1,0 +1,17 @@
+# Local credential overrides
+Config.h
+
+# Arduino IDE
+*.ino.bin
+*.ino.bootloader.bin
+*.ino.partitions.bin
+*.elf
+*.map
+
+# PlatformIO
+.pio/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
