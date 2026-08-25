@@ -1,0 +1,6 @@
+#pragma once
+
+// Copy this file to include/Config.h and update with your values.
+#define CFG_WIFI_SSID "YOUR_WIFI_SSID"
+#define CFG_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define CFG_INSTAGRAM_ACCESS_TOKEN "YOUR_INSTAGRAM_ACCESS_TOKEN"

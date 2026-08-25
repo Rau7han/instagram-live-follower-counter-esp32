@@ -2,6 +2,11 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <cstring>
+
+#if __has_include("Config.h")
+  #include "Config.h"
+#endif
 
 // ============================================================
 // LIVE INSTAGRAM FOLLOWER COUNTER
@@ -11,11 +16,19 @@
 // WIFI SETTINGS
 // ============================================================
 
+#ifndef CFG_WIFI_SSID
+  #define CFG_WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+
 const char* WIFI_SSID =
-  "ESP";
+  CFG_WIFI_SSID;
+
+#ifndef CFG_WIFI_PASSWORD
+  #define CFG_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
 
 const char* WIFI_PASSWORD =
-  "abcd1234";
+  CFG_WIFI_PASSWORD;
 
 
 // ============================================================
@@ -27,8 +40,12 @@ const char* WIFI_PASSWORD =
 // fields=followers_count
 // ============================================================
 
+#ifndef CFG_INSTAGRAM_ACCESS_TOKEN
+  #define CFG_INSTAGRAM_ACCESS_TOKEN "YOUR_INSTAGRAM_ACCESS_TOKEN"
+#endif
+
 const char* INSTAGRAM_ACCESS_TOKEN =
-  "INSTAGRAM_ACCESS_TOKEN";
+  CFG_INSTAGRAM_ACCESS_TOKEN;
 
 
 // ============================================================
@@ -307,6 +324,8 @@ uint32_t lastReconnectAttempt = 0;
 bool firstApiCheck = true;
 
 bool previousWiFiConnected = false;
+
+bool configurationWarningShown = false;
 
 
 // ============================================================
@@ -1973,12 +1992,57 @@ void compensateForNetworkDelay(
 
 
 // ============================================================
+// CONFIGURATION CHECK
+// ============================================================
+
+bool isPlaceholderValue(
+  const char* value,
+  const char* placeholder
+) {
+
+  return
+    value == nullptr ||
+    std::strcmp(value, placeholder) == 0;
+}
+
+
+bool hasValidInstagramToken() {
+
+  return
+    !isPlaceholderValue(
+      INSTAGRAM_ACCESS_TOKEN,
+      "YOUR_INSTAGRAM_ACCESS_TOKEN"
+    );
+}
+
+
+// ============================================================
 // FETCH LIVE INSTAGRAM FOLLOWERS
 // ============================================================
 
 bool fetchInstagramFollowers(
   uint32_t& followers
 ) {
+
+  if (
+    !hasValidInstagramToken()
+  ) {
+
+    if (
+      !configurationWarningShown
+    ) {
+
+      Serial.println(
+        "Set CFG_INSTAGRAM_ACCESS_TOKEN in Config.h before polling Instagram."
+      );
+
+      configurationWarningShown =
+        true;
+    }
+
+
+    return false;
+  }
 
   if (
     WiFi.status() !=
@@ -2440,6 +2504,22 @@ void pollInstagramNow() {
 // ============================================================
 
 void startWiFiConnection() {
+
+  if (
+    isPlaceholderValue(
+      WIFI_SSID,
+      "YOUR_WIFI_SSID"
+    ) ||
+    isPlaceholderValue(
+      WIFI_PASSWORD,
+      "YOUR_WIFI_PASSWORD"
+    )
+  ) {
+
+    Serial.println(
+      "Set CFG_WIFI_SSID and CFG_WIFI_PASSWORD in Config.h before connecting."
+    );
+  }
 
   Serial.println();
 
