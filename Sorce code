@@ -1,0 +1,3078 @@
+#include <FastLED.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// ============================================================
+// LIVE INSTAGRAM FOLLOWER COUNTER
+// ESP32 + WS2812B 32x8
+
+// ============================================================
+// WIFI SETTINGS
+// ============================================================
+
+const char* WIFI_SSID =
+  "ESP";
+
+const char* WIFI_PASSWORD =
+  "abcd1234";
+
+
+// ============================================================
+// META / INSTAGRAM TOKEN
+//
+// Same access token that works with your Python:
+//
+// https://graph.instagram.com/me
+// fields=followers_count
+// ============================================================
+
+const char* INSTAGRAM_ACCESS_TOKEN =
+  "INSTAGRAM_ACCESS_TOKEN";
+
+
+// ============================================================
+// API SETTINGS
+// ============================================================
+
+// Normal Instagram check interval
+//
+// 30000 = every 30 seconds
+//
+// For testing:
+// 10000 = every 10 seconds
+const uint32_t API_POLL_INTERVAL = 30000;
+
+// Retry failed API request after 10 seconds
+const uint32_t API_RETRY_INTERVAL = 10000;
+
+// WiFi reconnect attempts
+const uint32_t WIFI_RETRY_INTERVAL = 10000;
+
+// HTTP timeout
+const uint16_t HTTP_TIMEOUT = 10000;
+
+
+// ============================================================
+// LED MATRIX
+// ============================================================
+
+#define WIDTH       32
+#define HEIGHT      8
+#define NUM_LEDS    256
+
+#define DATA_PIN    13
+
+#define CHIPSET     WS2812B
+#define COLOR_ORDER GRB
+
+#define BRIGHTNESS  70
+
+#define MAX_MILLIAMPS 2500
+
+CRGB leds[NUM_LEDS];
+
+
+// ============================================================
+// DISPLAY LAYOUT
+//
+// x 0 - 7  = Instagram logo
+// x 8      = black separator
+// x 9 - 31 = follower counter
+//
+// Counter width = 23 pixels
+// ============================================================
+
+#define COUNTER_X 9
+
+#define MAX_DIGITS 6
+
+#define BLANK_DIGIT 10
+
+#define DIGIT_Y 1
+
+#define DIGIT_HEIGHT 5
+
+
+// ============================================================
+// ANIMATION SETTINGS
+// ============================================================
+
+// Normal mechanical number roll.
+//
+// Slightly slower than before so the physical roll
+// is clearly visible.
+const uint16_t FLIP_TIME = 480;
+
+// LED rendering ~50 FPS
+const uint16_t FRAME_TIME = 20;
+
+// Power-on full counter flip
+const uint32_t STARTUP_FLIP_TIME = 2000;
+
+// Speed of startup number cycles
+const uint16_t STARTUP_CYCLE_TIME = 180;
+
+// 2 -> 4 or 4 -> 6 panel-layout transition
+const uint16_t LAYOUT_FLIP_TIME = 900;
+
+// Small pause between mechanical catch-up steps
+const uint16_t CATCHUP_PAUSE = 80;
+
+// If Instagram jumped only a little,
+// mechanically show every count.
+//
+// Example:
+// 2305 API becomes 2308
+//
+// display:
+//
+// 2305
+// 2306
+// 2307
+// 2308
+const uint16_t MAX_CATCHUP = 30;
+
+
+// ============================================================
+// YOUR CORRECT MATRIX MAPPING
+//
+// DO NOT CHANGE.
+//
+// Physical panel:
+//
+// 32 vertical columns
+// 8 LEDs per column
+// serpentine / zig-zag
+// ============================================================
+
+uint16_t XY(uint8_t x, uint8_t y) {
+
+  if (x >= WIDTH || y >= HEIGHT) {
+    return 0;
+  }
+
+  if ((x & 1) == 0) {
+
+    // even column:
+    // top -> bottom
+
+    return
+      (x * HEIGHT) + y;
+
+  } else {
+
+    // odd column:
+    // bottom -> top
+
+    return
+      (x * HEIGHT) +
+      (HEIGHT - 1 - y);
+  }
+}
+
+
+// ============================================================
+// SAFE PIXEL
+// ============================================================
+
+void pixel(
+  int x,
+  int y,
+  CRGB color
+) {
+
+  if (
+    x < 0 ||
+    x >= WIDTH ||
+    y < 0 ||
+    y >= HEIGHT
+  ) {
+
+    return;
+  }
+
+
+  leds[XY(x, y)] =
+    color;
+}
+
+
+// ============================================================
+// 3x5 DIGIT FONT
+// ============================================================
+
+const uint8_t font3x5[10][5] = {
+
+  {0b111, 0b101, 0b101, 0b101, 0b111}, // 0
+
+  {0b010, 0b110, 0b010, 0b010, 0b111}, // 1
+
+  {0b111, 0b001, 0b111, 0b100, 0b111}, // 2
+
+  {0b111, 0b001, 0b111, 0b001, 0b111}, // 3
+
+  {0b101, 0b101, 0b111, 0b001, 0b001}, // 4
+
+  {0b111, 0b100, 0b111, 0b001, 0b111}, // 5
+
+  {0b111, 0b100, 0b111, 0b101, 0b111}, // 6
+
+  {0b111, 0b001, 0b001, 0b010, 0b010}, // 7
+
+  {0b111, 0b101, 0b111, 0b101, 0b111}, // 8
+
+  {0b111, 0b101, 0b111, 0b001, 0b111}  // 9
+};
+
+
+// ============================================================
+// LIVE FOLLOWER STATE
+// ============================================================
+
+// Number physically shown
+uint32_t followerCount = 0;
+
+// Latest value received from Instagram
+uint32_t liveFollowerCount = 0;
+
+// Current mechanical transition target
+uint32_t transitionTargetCount = 0;
+
+// True after first successful API response
+bool haveLiveCount = false;
+
+
+// ============================================================
+// DIGIT STATE
+// ============================================================
+
+uint8_t currentDigits[MAX_DIGITS];
+
+uint8_t targetDigits[MAX_DIGITS];
+
+// Current layout = 2 / 4 / 6 panels
+uint8_t currentSlotCount = 4;
+
+
+// ============================================================
+// NORMAL FLIP STATE
+// ============================================================
+
+bool flipping = false;
+
+int activeDigit = -1;
+
+// +1 = roll upward
+// -1 = roll downward
+int8_t rollDirection = 1;
+
+uint32_t flipStart = 0;
+
+uint32_t nextAnimationStep = 0;
+
+
+// ============================================================
+// STARTUP FLIP STATE
+// ============================================================
+
+bool startupFlipping = false;
+
+uint32_t startupFlipStart = 0;
+
+
+// ============================================================
+// LAYOUT CHANGE STATE
+// ============================================================
+
+bool layoutFlipping = false;
+
+uint32_t layoutFlipStart = 0;
+
+uint32_t layoutTargetCount = 0;
+
+uint8_t layoutTargetSlots = 4;
+
+
+// ============================================================
+// TIMERS
+// ============================================================
+
+uint32_t lastFrame = 0;
+
+uint32_t nextApiPoll = 0;
+
+uint32_t lastReconnectAttempt = 0;
+
+bool firstApiCheck = true;
+
+bool previousWiFiConnected = false;
+
+
+// ============================================================
+// SELECT 2 / 4 / 6 PANELS
+//
+// 0 - 99          = 2 panels
+// 100 - 9999      = 4 panels
+// 10000 - 999999  = 6 panels
+//
+// Therefore:
+//
+// 42     -> 42
+// 2305   -> 2305
+// 123456 -> 123456
+//
+// NO artificial leading zeroes.
+// ============================================================
+
+uint8_t getSlotCount(
+  uint32_t number
+) {
+
+  if (number < 100) {
+
+    return 2;
+  }
+
+
+  if (number < 10000) {
+
+    return 4;
+  }
+
+
+  return 6;
+}
+
+
+// ============================================================
+// PANEL WIDTH
+//
+// 2 digit:
+//
+// 10 + 3 gap + 10 = 23
+//
+// 4 digit:
+//
+// 5+1+5+1+5+1+5 = 23
+//
+// 6 digit:
+//
+// 3+1+3+1+3+1+3+1+3+1+3 = 23
+// ============================================================
+
+uint8_t getPanelWidth(
+  uint8_t slots
+) {
+
+  if (slots == 2) {
+
+    return 10;
+  }
+
+
+  if (slots == 4) {
+
+    return 5;
+  }
+
+
+  return 3;
+}
+
+
+// ============================================================
+// PANEL GAP WIDTH
+// ============================================================
+
+uint8_t getGapWidth(
+  uint8_t slots
+) {
+
+  if (slots == 2) {
+
+    return 3;
+  }
+
+
+  return 1;
+}
+
+
+// ============================================================
+// DIGIT HORIZONTAL SCALE
+//
+// 2-digit mode gets thicker/wider numbers.
+// ============================================================
+
+uint8_t getDigitScaleX(
+  uint8_t slots
+) {
+
+  if (slots == 2) {
+
+    return 2;
+  }
+
+
+  return 1;
+}
+
+
+// ============================================================
+// PANEL X POSITION
+// ============================================================
+
+int getPanelX(
+  uint8_t slot,
+  uint8_t slots
+) {
+
+  int panelWidth =
+    getPanelWidth(slots);
+
+
+  int gapWidth =
+    getGapWidth(slots);
+
+
+  return
+    COUNTER_X +
+    slot *
+    (
+      panelWidth +
+      gapWidth
+    );
+}
+
+
+// ============================================================
+// DIGIT X POSITION
+//
+// Centers digit inside panel.
+// ============================================================
+
+int getDigitX(
+  uint8_t slot,
+  uint8_t slots
+) {
+
+  int panelX =
+    getPanelX(
+      slot,
+      slots
+    );
+
+
+  int panelWidth =
+    getPanelWidth(
+      slots
+    );
+
+
+  int scaleX =
+    getDigitScaleX(
+      slots
+    );
+
+
+  int digitWidth =
+    3 * scaleX;
+
+
+  return
+    panelX +
+    (
+      panelWidth -
+      digitWidth
+    ) / 2;
+}
+
+
+// ============================================================
+// NUMBER -> DIGITS
+//
+// Example:
+//
+// 2305 + 4 panels:
+//
+// [2][3][0][5]
+//
+// Example:
+//
+// 305 + 4 panels:
+//
+// [blank][3][0][5]
+//
+// NOT:
+//
+// [0][3][0][5]
+// ============================================================
+
+void numberToDigits(
+  uint32_t number,
+  uint8_t slots,
+  uint8_t output[]
+) {
+
+  for (
+    int i = 0;
+    i < MAX_DIGITS;
+    i++
+  ) {
+
+    output[i] =
+      BLANK_DIGIT;
+  }
+
+
+  if (number == 0) {
+
+    output[slots - 1] =
+      0;
+
+
+    return;
+  }
+
+
+  int position =
+    slots - 1;
+
+
+  while (
+    number > 0 &&
+    position >= 0
+  ) {
+
+    output[position] =
+      number % 10;
+
+
+    number /= 10;
+
+
+    position--;
+  }
+}
+
+
+// ============================================================
+// IMPROVED INSTAGRAM LOGO GRADIENT
+//
+// purple -> magenta -> pink -> orange
+// ============================================================
+
+CRGB instagramColor(
+  uint8_t x,
+  uint8_t y,
+  uint32_t now
+) {
+
+  uint8_t position =
+    x * 11 +
+    y * 17;
+
+
+  CRGB color;
+
+
+  // Purple -> magenta
+  if (position < 55) {
+
+    color =
+      blend(
+        CRGB(75, 25, 190),
+        CRGB(170, 20, 180),
+        map(
+          position,
+          0,
+          54,
+          0,
+          255
+        )
+      );
+  }
+
+
+  // Magenta -> pink
+  else if (position < 108) {
+
+    color =
+      blend(
+        CRGB(170, 20, 180),
+        CRGB(235, 25, 120),
+        map(
+          position,
+          55,
+          107,
+          0,
+          255
+        )
+      );
+  }
+
+
+  // Pink -> orange
+  else {
+
+    int amount =
+      map(
+        position,
+        108,
+        190,
+        0,
+        255
+      );
+
+
+    amount =
+      constrain(
+        amount,
+        0,
+        255
+      );
+
+
+    color =
+      blend(
+        CRGB(235, 25, 120),
+        CRGB(255, 135, 25),
+        amount
+      );
+  }
+
+
+  // Slight warm/yellow lower edge
+  if (y >= 6) {
+
+    uint8_t amount =
+      (y - 5) * 28;
+
+
+    color =
+      blend(
+        color,
+        CRGB(255, 170, 45),
+        amount
+      );
+  }
+
+
+  // Keep logo gently alive
+  uint8_t breathe =
+    beatsin8(
+      7,
+      225,
+      255
+    );
+
+
+  color.nscale8_video(
+    breathe
+  );
+
+
+  return color;
+}
+
+
+// ============================================================
+// DRAW INSTAGRAM LOGO
+// ============================================================
+
+void drawInstagramLogo(
+  uint32_t now
+) {
+
+  // Gradient
+  for (
+    int y = 0;
+    y < 8;
+    y++
+  ) {
+
+    for (
+      int x = 0;
+      x < 8;
+      x++
+    ) {
+
+      pixel(
+        x,
+        y,
+        instagramColor(
+          x,
+          y,
+          now
+        )
+      );
+    }
+  }
+
+
+  CRGB W =
+    CRGB::White;
+
+
+  // Camera top
+  pixel(2, 1, W);
+  pixel(3, 1, W);
+  pixel(4, 1, W);
+  pixel(5, 1, W);
+
+
+  // Camera left
+  pixel(1, 2, W);
+  pixel(1, 3, W);
+  pixel(1, 4, W);
+  pixel(1, 5, W);
+
+
+  // Camera right
+  pixel(6, 2, W);
+  pixel(6, 3, W);
+  pixel(6, 4, W);
+  pixel(6, 5, W);
+
+
+  // Camera bottom
+  pixel(2, 6, W);
+  pixel(3, 6, W);
+  pixel(4, 6, W);
+  pixel(5, 6, W);
+
+
+  // Lens
+  pixel(3, 3, W);
+  pixel(4, 3, W);
+
+  pixel(3, 4, W);
+  pixel(4, 4, W);
+
+
+  // Small dot
+  pixel(5, 2, W);
+}
+
+
+// ============================================================
+// COUNTER PANEL GRADIENT
+//
+// Continuous gradient across entire counter.
+// This makes wide 4-digit panels look much better.
+// ============================================================
+
+CRGB counterPanelColor(
+  int x,
+  int y,
+  bool active
+) {
+
+  uint8_t horizontal =
+    map(
+      x,
+      COUNTER_X,
+      WIDTH - 1,
+      0,
+      255
+    );
+
+
+  // Top
+  CRGB upper =
+    blend(
+      CRGB(55, 5, 115),
+      CRGB(155, 5, 135),
+      horizontal
+    );
+
+
+  // Center
+  CRGB middle =
+    blend(
+      CRGB(170, 10, 155),
+      CRGB(235, 15, 110),
+      horizontal
+    );
+
+
+  // Bottom
+  CRGB lower =
+    blend(
+      CRGB(220, 10, 140),
+      CRGB(255, 70, 30),
+      horizontal
+    );
+
+
+  CRGB color;
+
+
+  if (y <= 3) {
+
+    color =
+      blend(
+        upper,
+        middle,
+        y * 70
+      );
+
+  } else {
+
+    color =
+      blend(
+        middle,
+        lower,
+        (y - 4) * 70
+      );
+  }
+
+
+  if (active) {
+
+    color.r =
+      qadd8(
+        color.r,
+        18
+      );
+
+
+    color.b =
+      qadd8(
+        color.b,
+        8
+      );
+  }
+
+
+  return color;
+}
+
+
+// ============================================================
+// DRAW ONE PANEL
+// ============================================================
+
+void drawPanel(
+  uint8_t slot,
+  uint8_t slots,
+  bool active
+) {
+
+  int panelX =
+    getPanelX(
+      slot,
+      slots
+    );
+
+
+  int panelWidth =
+    getPanelWidth(
+      slots
+    );
+
+
+  int gapWidth =
+    getGapWidth(
+      slots
+    );
+
+
+  // Panel body
+  for (
+    int y = 0;
+    y < HEIGHT;
+    y++
+  ) {
+
+    for (
+      int xx = 0;
+      xx < panelWidth;
+      xx++
+    ) {
+
+      int globalX =
+        panelX + xx;
+
+
+      pixel(
+        globalX,
+        y,
+        counterPanelColor(
+          globalX,
+          y,
+          active
+        )
+      );
+    }
+  }
+
+
+  // Mechanical center split
+  for (
+    int xx = 0;
+    xx < panelWidth;
+    xx++
+  ) {
+
+    int globalX =
+      panelX + xx;
+
+
+    CRGB hinge =
+      counterPanelColor(
+        globalX,
+        3,
+        false
+      );
+
+
+    hinge.nscale8_video(
+      72
+    );
+
+
+    pixel(
+      globalX,
+      3,
+      hinge
+    );
+  }
+
+
+  // Black panel gap
+  if (
+    slot <
+    slots - 1
+  ) {
+
+    int gapX =
+      panelX +
+      panelWidth;
+
+
+    for (
+      int gx = 0;
+      gx < gapWidth;
+      gx++
+    ) {
+
+      for (
+        int y = 0;
+        y < HEIGHT;
+        y++
+      ) {
+
+        pixel(
+          gapX + gx,
+          y,
+          CRGB::Black
+        );
+      }
+    }
+  }
+}
+
+
+// ============================================================
+// DRAW DIGIT AT ARBITRARY Y POSITION
+// ============================================================
+
+void drawDigitAt(
+  uint8_t number,
+  int startX,
+  int startY,
+  CRGB color,
+  uint8_t scaleX
+) {
+
+  if (number > 9) {
+
+    // BLANK_DIGIT
+    return;
+  }
+
+
+  for (
+    int row = 0;
+    row < DIGIT_HEIGHT;
+    row++
+  ) {
+
+    uint8_t bits =
+      font3x5[number][row];
+
+
+    for (
+      int col = 0;
+      col < 3;
+      col++
+    ) {
+
+      if (
+        bits &
+        (1 << (2 - col))
+      ) {
+
+        for (
+          int sx = 0;
+          sx < scaleX;
+          sx++
+        ) {
+
+          int px =
+            startX +
+            col * scaleX +
+            sx;
+
+
+          int py =
+            startY +
+            row;
+
+
+          if (
+            px >= COUNTER_X &&
+            px < WIDTH &&
+            py >= 0 &&
+            py < HEIGHT
+          ) {
+
+            pixel(
+              px,
+              py,
+              color
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
+
+// ============================================================
+// STATIC DIGIT
+// ============================================================
+
+void drawStaticDigit(
+  uint8_t slot,
+  uint8_t slots,
+  uint8_t value
+) {
+
+  if (
+    value ==
+    BLANK_DIGIT
+  ) {
+
+    return;
+  }
+
+
+  int x =
+    getDigitX(
+      slot,
+      slots
+    );
+
+
+  uint8_t scaleX =
+    getDigitScaleX(
+      slots
+    );
+
+
+  drawDigitAt(
+    value,
+    x,
+    DIGIT_Y,
+    CRGB(250, 245, 255),
+    scaleX
+  );
+}
+
+
+// ============================================================
+// MECHANICAL ROLL
+//
+// INCREASE:
+// old digit goes UP
+// new digit enters from BOTTOM
+//
+// DECREASE:
+// old digit goes DOWN
+// new digit enters from TOP
+//
+// IMPORTANT:
+//
+// ease8InOutQuad makes the movement much more visible
+// and mechanical on an 8-pixel-high display.
+// ============================================================
+
+void drawRollingDigit(
+  uint8_t slot,
+  uint8_t slots,
+  uint8_t oldDigit,
+  uint8_t newDigit,
+  uint8_t progress,
+  int8_t direction
+) {
+
+  int digitX =
+    getDigitX(
+      slot,
+      slots
+    );
+
+
+  int panelX =
+    getPanelX(
+      slot,
+      slots
+    );
+
+
+  int panelWidth =
+    getPanelWidth(
+      slots
+    );
+
+
+  uint8_t scaleX =
+    getDigitScaleX(
+      slots
+    );
+
+
+  // Smooth mechanical easing
+  uint8_t eased =
+    ease8InOutQuad(
+      progress
+    );
+
+
+  int movement =
+    (
+      (uint16_t)eased *
+      6
+    ) / 255;
+
+
+  int oldY;
+  int newY;
+
+
+  // Increasing followers
+  if (direction >= 0) {
+
+    oldY =
+      DIGIT_Y -
+      movement;
+
+
+    newY =
+      DIGIT_Y +
+      6 -
+      movement;
+  }
+
+
+  // Decreasing followers
+  else {
+
+    oldY =
+      DIGIT_Y +
+      movement;
+
+
+    newY =
+      DIGIT_Y -
+      6 +
+      movement;
+  }
+
+
+  // ==========================================================
+  // OLD DIGIT
+  // white -> pink while leaving
+  // ==========================================================
+
+  CRGB oldColor =
+    blend(
+      CRGB(250, 245, 255),
+      CRGB(255, 90, 150),
+      progress
+    );
+
+
+  drawDigitAt(
+    oldDigit,
+    digitX,
+    oldY,
+    oldColor,
+    scaleX
+  );
+
+
+  // ==========================================================
+  // NEW DIGIT
+  // pink -> white while arriving
+  // ==========================================================
+
+  CRGB newColor =
+    blend(
+      CRGB(255, 90, 145),
+      CRGB(250, 245, 255),
+      progress
+    );
+
+
+  drawDigitAt(
+    newDigit,
+    digitX,
+    newY,
+    newColor,
+    scaleX
+  );
+
+
+  // ==========================================================
+  // HINGE FLASH
+  // ==========================================================
+
+  int distance =
+    abs(
+      (int)progress -
+      128
+    );
+
+
+  if (
+    distance < 24
+  ) {
+
+    uint8_t strength =
+      255 -
+      distance * 10;
+
+
+    CRGB flash =
+      CRGB(
+        strength,
+        strength / 3,
+        strength / 2
+      );
+
+
+    for (
+      int xx = 0;
+      xx < panelWidth;
+      xx++
+    ) {
+
+      pixel(
+        panelX + xx,
+        3,
+        flash
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// FIND RIGHTMOST CHANGED DIGIT
+// ============================================================
+
+int findRightmostChangedDigit() {
+
+  for (
+    int i =
+      currentSlotCount - 1;
+
+    i >= 0;
+
+    i--
+  ) {
+
+    if (
+      currentDigits[i] !=
+      targetDigits[i]
+    ) {
+
+      return i;
+    }
+  }
+
+
+  return -1;
+}
+
+
+// ============================================================
+// FIND NEXT CHANGED DIGIT TO LEFT
+// ============================================================
+
+int findNextChangedDigitToLeft(
+  int currentSlot
+) {
+
+  for (
+    int i =
+      currentSlot - 1;
+
+    i >= 0;
+
+    i--
+  ) {
+
+    if (
+      currentDigits[i] !=
+      targetDigits[i]
+    ) {
+
+      return i;
+    }
+  }
+
+
+  return -1;
+}
+
+
+// ============================================================
+// START NORMAL NUMBER TRANSITION
+// ============================================================
+
+void startTransitionTo(
+  uint32_t newCount,
+  uint32_t now
+) {
+
+  transitionTargetCount =
+    newCount;
+
+
+  if (
+    newCount >=
+    followerCount
+  ) {
+
+    rollDirection =
+      1;
+
+  } else {
+
+    rollDirection =
+      -1;
+  }
+
+
+  numberToDigits(
+    newCount,
+    currentSlotCount,
+    targetDigits
+  );
+
+
+  activeDigit =
+    findRightmostChangedDigit();
+
+
+  if (
+    activeDigit >= 0
+  ) {
+
+    flipping =
+      true;
+
+
+    // IMPORTANT:
+    // fresh timestamp
+    flipStart =
+      now;
+
+
+    Serial.print(
+      "Starting flip: "
+    );
+
+
+    Serial.print(
+      followerCount
+    );
+
+
+    Serial.print(
+      " -> "
+    );
+
+
+    Serial.println(
+      newCount
+    );
+  }
+}
+
+
+// ============================================================
+// FINISH CURRENT DIGIT
+//
+// Carry works right -> left.
+//
+// Example:
+//
+// 2309 -> 2310
+//
+// 9 -> 0 first
+// 0 -> 1 second
+// ============================================================
+
+void finishCurrentDigit(
+  uint32_t now
+) {
+
+  if (
+    activeDigit < 0
+  ) {
+
+    return;
+  }
+
+
+  currentDigits[activeDigit] =
+    targetDigits[activeDigit];
+
+
+  int nextDigit =
+    findNextChangedDigitToLeft(
+      activeDigit
+    );
+
+
+  if (
+    nextDigit >= 0
+  ) {
+
+    activeDigit =
+      nextDigit;
+
+
+    flipStart =
+      now;
+
+
+    return;
+  }
+
+
+  // Entire count step completed
+  followerCount =
+    transitionTargetCount;
+
+
+  flipping =
+    false;
+
+
+  activeDigit =
+    -1;
+
+
+  nextAnimationStep =
+    now +
+    CATCHUP_PAUSE;
+
+
+  Serial.print(
+    "Display now: "
+  );
+
+
+  Serial.println(
+    followerCount
+  );
+}
+
+
+// ============================================================
+// START PANEL-LAYOUT CHANGE
+//
+// Example:
+//
+// 99 -> 100
+//
+// 2 panels -> 4 panels
+//
+// 9999 -> 10000
+//
+// 4 panels -> 6 panels
+// ============================================================
+
+void startLayoutFlip(
+  uint32_t newCount,
+  uint32_t now
+) {
+
+  layoutTargetCount =
+    newCount;
+
+
+  layoutTargetSlots =
+    getSlotCount(
+      newCount
+    );
+
+
+  layoutFlipping =
+    true;
+
+
+  layoutFlipStart =
+    now;
+}
+
+
+// ============================================================
+// FINISH PANEL-LAYOUT CHANGE
+// ============================================================
+
+void finishLayoutFlip(
+  uint32_t now
+) {
+
+  currentSlotCount =
+    layoutTargetSlots;
+
+
+  followerCount =
+    layoutTargetCount;
+
+
+  transitionTargetCount =
+    followerCount;
+
+
+  numberToDigits(
+    followerCount,
+    currentSlotCount,
+    currentDigits
+  );
+
+
+  numberToDigits(
+    followerCount,
+    currentSlotCount,
+    targetDigits
+  );
+
+
+  layoutFlipping =
+    false;
+
+
+  nextAnimationStep =
+    now +
+    CATCHUP_PAUSE;
+}
+
+
+// ============================================================
+// POWER-ON FULL FLIP
+//
+// No random data.
+//
+// Deterministic 0-9 cycling just for visual animation.
+// ============================================================
+
+void drawFullFlipAnimation(
+  uint8_t slots,
+  uint32_t elapsed
+) {
+
+  uint32_t cycle =
+    elapsed /
+    STARTUP_CYCLE_TIME;
+
+
+  uint32_t cyclePosition =
+    elapsed %
+    STARTUP_CYCLE_TIME;
+
+
+  uint8_t progress =
+    (
+      cyclePosition *
+      255UL
+    ) /
+    STARTUP_CYCLE_TIME;
+
+
+  for (
+    uint8_t i = 0;
+    i < slots;
+    i++
+  ) {
+
+    uint8_t oldDigit =
+      (
+        cycle +
+        i * 2
+      ) %
+      10;
+
+
+    uint8_t newDigit =
+      (
+        oldDigit +
+        1
+      ) %
+      10;
+
+
+    drawRollingDigit(
+      i,
+      slots,
+      oldDigit,
+      newDigit,
+      progress,
+      1
+    );
+  }
+}
+
+
+// ============================================================
+// UPDATE PHYSICAL DISPLAY TOWARD LIVE INSTAGRAM COUNT
+// ============================================================
+
+void updateLiveCounter(
+  uint32_t now
+) {
+
+  if (
+    !haveLiveCount ||
+    startupFlipping ||
+    layoutFlipping ||
+    flipping
+  ) {
+
+    return;
+  }
+
+
+  if (
+    (int32_t)(
+      now -
+      nextAnimationStep
+    ) < 0
+  ) {
+
+    return;
+  }
+
+
+  // Already synchronized
+  if (
+    followerCount ==
+    liveFollowerCount
+  ) {
+
+    return;
+  }
+
+
+  uint32_t difference;
+
+
+  if (
+    liveFollowerCount >
+    followerCount
+  ) {
+
+    difference =
+      liveFollowerCount -
+      followerCount;
+
+  } else {
+
+    difference =
+      followerCount -
+      liveFollowerCount;
+  }
+
+
+  uint32_t nextCount;
+
+
+  // ==========================================================
+  // SMALL DIFFERENCE:
+  // mechanically count every follower
+  // ==========================================================
+
+  if (
+    difference <=
+    MAX_CATCHUP
+  ) {
+
+    if (
+      liveFollowerCount >
+      followerCount
+    ) {
+
+      nextCount =
+        followerCount + 1;
+
+    } else {
+
+      nextCount =
+        followerCount - 1;
+    }
+  }
+
+
+  // ==========================================================
+  // LARGE DIFFERENCE:
+  // directly target latest value,
+  // but still animate changed digit wheels
+  // ==========================================================
+
+  else {
+
+    nextCount =
+      liveFollowerCount;
+  }
+
+
+  uint8_t newSlots =
+    getSlotCount(
+      nextCount
+    );
+
+
+  // Layout length changed
+  if (
+    newSlots !=
+    currentSlotCount
+  ) {
+
+    startLayoutFlip(
+      nextCount,
+      now
+    );
+
+
+    return;
+  }
+
+
+  // Normal mechanical update
+  startTransitionTo(
+    nextCount,
+    now
+  );
+}
+
+
+// ============================================================
+// JSON FOLLOWERS_COUNT PARSER
+//
+// Reads:
+//
+// "followers_count":2305
+//
+// No ArduinoJson library required.
+// ============================================================
+
+bool parseFollowersCount(
+  const String& json,
+  uint32_t& result
+) {
+
+  const String key =
+    "\"followers_count\"";
+
+
+  int keyPosition =
+    json.indexOf(
+      key
+    );
+
+
+  if (
+    keyPosition < 0
+  ) {
+
+    return false;
+  }
+
+
+  int colonPosition =
+    json.indexOf(
+      ':',
+      keyPosition
+    );
+
+
+  if (
+    colonPosition < 0
+  ) {
+
+    return false;
+  }
+
+
+  int position =
+    colonPosition + 1;
+
+
+  // Skip whitespace
+  while (
+    position <
+    json.length()
+  ) {
+
+    char c =
+      json[position];
+
+
+    if (
+      c != ' ' &&
+      c != '\t' &&
+      c != '\r' &&
+      c != '\n'
+    ) {
+
+      break;
+    }
+
+
+    position++;
+  }
+
+
+  uint32_t value =
+    0;
+
+
+  bool foundDigit =
+    false;
+
+
+  while (
+    position <
+    json.length()
+  ) {
+
+    char c =
+      json[position];
+
+
+    if (
+      c < '0' ||
+      c > '9'
+    ) {
+
+      break;
+    }
+
+
+    foundDigit =
+      true;
+
+
+    value =
+      value * 10 +
+      (c - '0');
+
+
+    position++;
+  }
+
+
+  if (
+    !foundDigit
+  ) {
+
+    return false;
+  }
+
+
+  result =
+    value;
+
+
+  return true;
+}
+
+
+// ============================================================
+// PAUSE ANIMATION CLOCKS WHILE HTTPS IS BLOCKING
+//
+// THIS FIXES THE IMPORTANT BUG.
+//
+// HTTPS may take 500ms+.
+//
+// Without this:
+// FLIP_TIME = 480ms
+//
+// HTTP request can consume the entire animation time,
+// making:
+//
+// 7 -> 8
+//
+// appear instant.
+//
+// This function shifts animation clocks forward by however
+// long the HTTP request took.
+// ============================================================
+
+void compensateForNetworkDelay(
+  uint32_t networkDuration
+) {
+
+  if (
+    networkDuration == 0
+  ) {
+
+    return;
+  }
+
+
+  if (flipping) {
+
+    flipStart +=
+      networkDuration;
+  }
+
+
+  if (startupFlipping) {
+
+    startupFlipStart +=
+      networkDuration;
+  }
+
+
+  if (layoutFlipping) {
+
+    layoutFlipStart +=
+      networkDuration;
+  }
+
+
+  if (
+    nextAnimationStep != 0
+  ) {
+
+    nextAnimationStep +=
+      networkDuration;
+  }
+}
+
+
+// ============================================================
+// FETCH LIVE INSTAGRAM FOLLOWERS
+// ============================================================
+
+bool fetchInstagramFollowers(
+  uint32_t& followers
+) {
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  ) {
+
+    Serial.println(
+      "Instagram request skipped: WiFi disconnected."
+    );
+
+
+    return false;
+  }
+
+
+  WiFiClientSecure client;
+
+
+  // Simple testing configuration.
+  //
+  // For final production hardware,
+  // replace this with CA certificate validation.
+  client.setInsecure();
+
+
+  HTTPClient http;
+
+
+  String url =
+    "https://graph.instagram.com/me"
+    "?fields=followers_count"
+    "&access_token=";
+
+
+  url +=
+    INSTAGRAM_ACCESS_TOKEN;
+
+
+  http.setTimeout(
+    HTTP_TIMEOUT
+  );
+
+
+  // Ask intermediary caches not to reuse an old result.
+  http.addHeader(
+    "Cache-Control",
+    "no-cache"
+  );
+
+
+  Serial.println();
+  Serial.println(
+    "--------------------------------"
+  );
+
+  Serial.println(
+    "Checking LIVE Instagram followers..."
+  );
+
+
+  if (
+    !http.begin(
+      client,
+      url
+    )
+  ) {
+
+    Serial.println(
+      "HTTP begin failed."
+    );
+
+
+    return false;
+  }
+
+
+  int httpCode =
+    http.GET();
+
+
+  Serial.print(
+    "HTTP status: "
+  );
+
+
+  Serial.println(
+    httpCode
+  );
+
+
+  if (
+    httpCode !=
+    HTTP_CODE_OK
+  ) {
+
+    String errorPayload =
+      http.getString();
+
+
+    Serial.println(
+      "Instagram API error:"
+    );
+
+
+    Serial.println(
+      errorPayload
+    );
+
+
+    http.end();
+
+
+    return false;
+  }
+
+
+  String payload =
+    http.getString();
+
+
+  http.end();
+
+
+  uint32_t count =
+    0;
+
+
+  if (
+    !parseFollowersCount(
+      payload,
+      count
+    )
+  ) {
+
+    Serial.println(
+      "ERROR: followers_count not found."
+    );
+
+
+    Serial.println(
+      payload
+    );
+
+
+    return false;
+  }
+
+
+  followers =
+    count;
+
+
+  Serial.print(
+    "Instagram followers = "
+  );
+
+
+  Serial.println(
+    followers
+  );
+
+
+  return true;
+}
+
+
+// ============================================================
+// PROCESS SUCCESSFUL INSTAGRAM RESULT
+// ============================================================
+
+void processInstagramResult(
+  uint32_t apiCount,
+  uint32_t now
+) {
+
+  // Current physical design supports 6 digits
+  if (
+    apiCount >
+    999999
+  ) {
+
+    apiCount =
+      999999;
+  }
+
+
+  // ==========================================================
+  // FIRST SUCCESSFUL API RESPONSE
+  // ==========================================================
+
+  if (
+    !haveLiveCount
+  ) {
+
+    haveLiveCount =
+      true;
+
+
+    liveFollowerCount =
+      apiCount;
+
+
+    followerCount =
+      apiCount;
+
+
+    transitionTargetCount =
+      apiCount;
+
+
+    currentSlotCount =
+      getSlotCount(
+        apiCount
+      );
+
+
+    numberToDigits(
+      followerCount,
+      currentSlotCount,
+      currentDigits
+    );
+
+
+    numberToDigits(
+      followerCount,
+      currentSlotCount,
+      targetDigits
+    );
+
+
+    // Start the requested 2-second full flip
+    startupFlipping =
+      true;
+
+
+    startupFlipStart =
+      now;
+
+
+    Serial.println();
+
+    Serial.print(
+      "First live count: "
+    );
+
+
+    Serial.println(
+      apiCount
+    );
+
+
+    Serial.print(
+      "Using "
+    );
+
+
+    Serial.print(
+      currentSlotCount
+    );
+
+
+    Serial.println(
+      "-digit layout."
+    );
+
+
+    Serial.println(
+      "Starting 2-second startup flip..."
+    );
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // NORMAL LIVE RESULT
+  // ==========================================================
+
+  Serial.print(
+    "Physical display = "
+  );
+
+
+  Serial.println(
+    followerCount
+  );
+
+
+  Serial.print(
+    "Previous API     = "
+  );
+
+
+  Serial.println(
+    liveFollowerCount
+  );
+
+
+  Serial.print(
+    "New API          = "
+  );
+
+
+  Serial.println(
+    apiCount
+  );
+
+
+  if (
+    apiCount !=
+    liveFollowerCount
+  ) {
+
+    Serial.println(
+      "*** FOLLOWER CHANGE DETECTED ***"
+    );
+
+
+    // IMPORTANT:
+    //
+    // Do NOT change followerCount here.
+    //
+    // Only update desired live value.
+    //
+    // updateLiveCounter() will animate toward it.
+    liveFollowerCount =
+      apiCount;
+  }
+
+
+  else {
+
+    Serial.println(
+      "Follower count unchanged."
+    );
+  }
+}
+
+
+// ============================================================
+// RUN ONE API POLL
+//
+// Network request timing is measured.
+//
+// After the request:
+//
+// 1. animation clocks are compensated
+// 2. a FRESH millis() is used
+// 3. next API poll is scheduled
+// ============================================================
+
+void pollInstagramNow() {
+
+  uint32_t networkStart =
+    millis();
+
+
+  uint32_t apiFollowers =
+    0;
+
+
+  bool success =
+    fetchInstagramFollowers(
+      apiFollowers
+    );
+
+
+  uint32_t networkEnd =
+    millis();
+
+
+  uint32_t networkDuration =
+    networkEnd -
+    networkStart;
+
+
+  // ==========================================================
+  // CRITICAL ANIMATION FIX
+  // ==========================================================
+
+  compensateForNetworkDelay(
+    networkDuration
+  );
+
+
+  Serial.print(
+    "API request duration: "
+  );
+
+
+  Serial.print(
+    networkDuration
+  );
+
+
+  Serial.println(
+    " ms"
+  );
+
+
+  // FRESH time AFTER HTTPS request
+  uint32_t freshNow =
+    millis();
+
+
+  if (success) {
+
+    processInstagramResult(
+      apiFollowers,
+      freshNow
+    );
+
+
+    nextApiPoll =
+      freshNow +
+      API_POLL_INTERVAL;
+  }
+
+
+  else {
+
+    Serial.println(
+      "API check failed. Keeping last valid follower count."
+    );
+
+
+    nextApiPoll =
+      freshNow +
+      API_RETRY_INTERVAL;
+  }
+
+
+  Serial.print(
+    "Next API check in about "
+  );
+
+
+  Serial.print(
+    success
+      ? API_POLL_INTERVAL / 1000
+      : API_RETRY_INTERVAL / 1000
+  );
+
+
+  Serial.println(
+    " seconds."
+  );
+
+
+  Serial.println(
+    "--------------------------------"
+  );
+}
+
+
+// ============================================================
+// START WIFI
+// ============================================================
+
+void startWiFiConnection() {
+
+  Serial.println();
+
+  Serial.print(
+    "Connecting to WiFi: "
+  );
+
+
+  Serial.println(
+    WIFI_SSID
+  );
+
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+
+  lastReconnectAttempt =
+    millis();
+}
+
+
+// ============================================================
+// COMPLETE DISPLAY FRAME
+// ============================================================
+
+void renderDisplay(
+  uint32_t now
+) {
+
+  FastLED.clear();
+
+
+  // ==========================================================
+  // INSTAGRAM LOGO
+  // ==========================================================
+
+  drawInstagramLogo(
+    now
+  );
+
+
+  // ==========================================================
+  // BLACK DIVIDER
+  // ==========================================================
+
+  for (
+    int y = 0;
+    y < HEIGHT;
+    y++
+  ) {
+
+    pixel(
+      8,
+      y,
+      CRGB::Black
+    );
+  }
+
+
+  // ==========================================================
+  // WAITING FOR FIRST API RESPONSE
+  //
+  // Instagram logo only.
+  // ==========================================================
+
+  if (
+    !haveLiveCount
+  ) {
+
+    FastLED.show();
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // 2-SECOND STARTUP FULL FLIP
+  // ==========================================================
+
+  if (
+    startupFlipping
+  ) {
+
+    for (
+      uint8_t i = 0;
+      i < currentSlotCount;
+      i++
+    ) {
+
+      drawPanel(
+        i,
+        currentSlotCount,
+        true
+      );
+    }
+
+
+    drawFullFlipAnimation(
+      currentSlotCount,
+      now -
+      startupFlipStart
+    );
+
+
+    FastLED.show();
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // LAYOUT TRANSITION
+  // ==========================================================
+
+  if (
+    layoutFlipping
+  ) {
+
+    for (
+      uint8_t i = 0;
+      i < layoutTargetSlots;
+      i++
+    ) {
+
+      drawPanel(
+        i,
+        layoutTargetSlots,
+        true
+      );
+    }
+
+
+    drawFullFlipAnimation(
+      layoutTargetSlots,
+      now -
+      layoutFlipStart
+    );
+
+
+    FastLED.show();
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // NORMAL COLOR PANELS
+  // ==========================================================
+
+  for (
+    uint8_t i = 0;
+    i < currentSlotCount;
+    i++
+  ) {
+
+    drawPanel(
+      i,
+      currentSlotCount,
+      flipping &&
+      i == activeDigit
+    );
+  }
+
+
+  // ==========================================================
+  // DIGITS
+  // ==========================================================
+
+  for (
+    uint8_t i = 0;
+    i < currentSlotCount;
+    i++
+  ) {
+
+    // Active rolling digit
+    if (
+      flipping &&
+      i == activeDigit
+    ) {
+
+      uint32_t elapsed =
+        now -
+        flipStart;
+
+
+      if (
+        elapsed >=
+        FLIP_TIME
+      ) {
+
+        drawStaticDigit(
+          i,
+          currentSlotCount,
+          targetDigits[i]
+        );
+
+      } else {
+
+        uint8_t progress =
+          (
+            elapsed *
+            255UL
+          ) /
+          FLIP_TIME;
+
+
+        drawRollingDigit(
+          i,
+          currentSlotCount,
+          currentDigits[i],
+          targetDigits[i],
+          progress,
+          rollDirection
+        );
+      }
+    }
+
+
+    // Non-moving digit
+    else {
+
+      drawStaticDigit(
+        i,
+        currentSlotCount,
+        currentDigits[i]
+      );
+    }
+  }
+
+
+  FastLED.show();
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(
+    115200
+  );
+
+
+  delay(300);
+
+
+  Serial.println();
+
+  Serial.println(
+    "===================================="
+  );
+
+  Serial.println(
+    " LIVE INSTAGRAM FOLLOWER COUNTER"
+  );
+
+  Serial.println(
+    "===================================="
+  );
+
+
+  // ==========================================================
+  // FASTLED
+  // ==========================================================
+
+  FastLED.addLeds<
+    CHIPSET,
+    DATA_PIN,
+    COLOR_ORDER
+  >(
+    leds,
+    NUM_LEDS
+  );
+
+
+  FastLED.setBrightness(
+    BRIGHTNESS
+  );
+
+
+  FastLED.setMaxPowerInVoltsAndMilliamps(
+    5,
+    MAX_MILLIAMPS
+  );
+
+
+  FastLED.clear();
+
+
+  FastLED.show();
+
+
+  // ==========================================================
+  // WIFI
+  // ==========================================================
+
+  WiFi.mode(
+    WIFI_STA
+  );
+
+
+  WiFi.setAutoReconnect(
+    true
+  );
+
+
+  // Helps responsiveness on permanently powered ESP32 displays
+  WiFi.setSleep(
+    false
+  );
+
+
+  startWiFiConnection();
+
+
+  // First Instagram request happens immediately after WiFi
+  // connects.
+  firstApiCheck =
+    true;
+
+
+  nextApiPoll =
+    0;
+
+
+  previousWiFiConnected =
+    false;
+
+
+  renderDisplay(
+    millis()
+  );
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  uint32_t now =
+    millis();
+
+
+  // ==========================================================
+  // WIFI STATE
+  // ==========================================================
+
+  bool wifiConnected =
+    (
+      WiFi.status() ==
+      WL_CONNECTED
+    );
+
+
+  // ==========================================================
+  // WIFI JUST CONNECTED / RECONNECTED
+  // ==========================================================
+
+  if (
+    wifiConnected &&
+    !previousWiFiConnected
+  ) {
+
+    Serial.println();
+
+    Serial.println(
+      "WiFi connected!"
+    );
+
+
+    Serial.print(
+      "ESP32 IP: "
+    );
+
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+
+    // Force immediate Instagram refresh
+    firstApiCheck =
+      true;
+  }
+
+
+  previousWiFiConnected =
+    wifiConnected;
+
+
+  // ==========================================================
+  // WIFI RECONNECT
+  // ==========================================================
+
+  if (
+    !wifiConnected
+  ) {
+
+    if (
+      now -
+      lastReconnectAttempt >=
+      WIFI_RETRY_INTERVAL
+    ) {
+
+      lastReconnectAttempt =
+        now;
+
+
+      Serial.println(
+        "WiFi disconnected. Reconnecting..."
+      );
+
+
+      WiFi.disconnect();
+
+
+      WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD
+      );
+    }
+  }
+
+
+  // ==========================================================
+  // LIVE INSTAGRAM POLLING
+  //
+  // IMPORTANT:
+  //
+  // NOT dependent on:
+  //
+  //   flipping
+  //   startupFlipping
+  //   layoutFlipping
+  //
+  // It continues checking Instagram regardless.
+  // ==========================================================
+
+  if (
+    wifiConnected
+  ) {
+
+    if (
+      firstApiCheck ||
+      (
+        (int32_t)(
+          now -
+          nextApiPoll
+        ) >= 0
+      )
+    ) {
+
+      firstApiCheck =
+        false;
+
+
+      Serial.println();
+
+      Serial.println(
+        "===================================="
+      );
+
+      Serial.println(
+        " POLLING INSTAGRAM"
+      );
+
+      Serial.println(
+        "===================================="
+      );
+
+
+      pollInstagramNow();
+
+
+      // ======================================================
+      // VERY IMPORTANT
+      //
+      // HTTP GET was blocking.
+      //
+      // Throw away old 'now' and get a FRESH time.
+      // ======================================================
+
+      now =
+        millis();
+    }
+  }
+
+
+  // ==========================================================
+  // FINISH STARTUP FLIP
+  // ==========================================================
+
+  if (
+    startupFlipping &&
+    (
+      now -
+      startupFlipStart >=
+      STARTUP_FLIP_TIME
+    )
+  ) {
+
+    startupFlipping =
+      false;
+
+
+    // Use latest API value.
+    //
+    // If follower count changed while startup was spinning,
+    // display the newest value.
+    followerCount =
+      liveFollowerCount;
+
+
+    transitionTargetCount =
+      followerCount;
+
+
+    currentSlotCount =
+      getSlotCount(
+        followerCount
+      );
+
+
+    numberToDigits(
+      followerCount,
+      currentSlotCount,
+      currentDigits
+    );
+
+
+    numberToDigits(
+      followerCount,
+      currentSlotCount,
+      targetDigits
+    );
+
+
+    nextAnimationStep =
+      now +
+      CATCHUP_PAUSE;
+
+
+    Serial.println();
+
+    Serial.println(
+      "Startup animation finished."
+    );
+
+
+    Serial.print(
+      "Displaying LIVE followers: "
+    );
+
+
+    Serial.println(
+      followerCount
+    );
+  }
+
+
+  // ==========================================================
+  // FINISH 2/4/6 LAYOUT TRANSITION
+  // ==========================================================
+
+  if (
+    layoutFlipping &&
+    (
+      now -
+      layoutFlipStart >=
+      LAYOUT_FLIP_TIME
+    )
+  ) {
+
+    finishLayoutFlip(
+      now
+    );
+  }
+
+
+  // ==========================================================
+  // FINISH CURRENT MECHANICAL DIGIT
+  // ==========================================================
+
+  if (
+    flipping &&
+    (
+      now -
+      flipStart >=
+      FLIP_TIME
+    )
+  ) {
+
+    finishCurrentDigit(
+      now
+    );
+  }
+
+
+  // ==========================================================
+  // MOVE DISPLAY TOWARD CURRENT LIVE INSTAGRAM COUNT
+  // ==========================================================
+
+  updateLiveCounter(
+    now
+  );
+
+
+  // ==========================================================
+  // DISPLAY RENDER
+  // ==========================================================
+
+  if (
+    now -
+    lastFrame >=
+    FRAME_TIME
+  ) {
+
+    lastFrame =
+      now;
+
+
+    renderDisplay(
+      now
+    );
+  }
+}
